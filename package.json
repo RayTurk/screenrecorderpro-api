@@ -1,0 +1,15 @@
+﻿{
+  "name": "screenrecorderpro-api",
+  "version": "1.0.0",
+  "description": "Screen Recorder Pro API Functions",
+  "main": "index.js",
+  "dependencies": {
+    "node-fetch": "^2.6.7"
+  },
+  "scripts": {
+    "build": "echo 'No build needed'",
+    "dev": "netlify dev"
+  },
+  "author": "Your Name",
+  "license": "MIT"
+}

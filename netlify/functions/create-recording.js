@@ -1,110 +1,133 @@
 const fetch = require('node-fetch');
 
 exports.handler = async (event, context) => {
-  // Set a 9-second timeout for the entire function
-  context.callbackWaitsForEmptyEventLoop = false;
+  console.log('=== Screen Recorder Pro API Called ===');
+  console.log('Method:', event.httpMethod);
+  console.log('Environment check - API key present:', !!process.env.SCREENSHOTONE_API_KEY);
+
+  const headers = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Plugin-License, User-Agent',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Content-Type': 'application/json'
+  };
+
+  if (event.httpMethod === 'OPTIONS') {
+    return { statusCode: 200, headers, body: JSON.stringify({ message: 'CORS preflight successful' }) };
+  }
 
   if (event.httpMethod !== 'POST') {
     return {
       statusCode: 405,
-      body: JSON.stringify({ message: 'Method not allowed' })
+      headers,
+      body: JSON.stringify({ message: 'Method not allowed. Use POST.' })
     };
   }
 
   try {
-    const { url, options, license_key, site_url } = JSON.parse(event.body);
-
-    console.log('Received options:', JSON.stringify(options, null, 2));
-
-    // Use the optimized timeout from WordPress
-    const apiTimeout = options.timeout || 6; // Default to 6 seconds
-    const scrollDuration = options.scroll_duration || 800; // Use optimized scroll duration
-
-    console.log(`Using API timeout: ${apiTimeout}s, scroll duration: ${scrollDuration}ms`);
-
-    // Build ScreenshotOne API URL with optimized parameters
-    const screenshotOneUrl = 'https://api.screenshotone.com/animate?' + new URLSearchParams({
-      access_key: process.env.SCREENSHOTONE_API_KEY || 'V3mF4QholiL8Qw',
-      url: url,
-      format: options.format || 'mp4',
-      duration: Math.min(options.duration || 5, 5), // Cap at 5 seconds
-      scenario: 'scroll',
-      viewport_width: options.viewport_width || 820,
-      viewport_height: options.viewport_height || 1180,
-      viewport_mobile: options.device_type === 'mobile' ? 'true' : 'false',
-
-      // Use optimized timeout and scroll settings
-      timeout: apiTimeout, // Use the optimized timeout
-      scroll_duration: scrollDuration, // Use optimized scroll duration
-      scroll_start_immediately: 'true',
-      scroll_complete: 'true',
-
-      // Performance optimizations
-      block_ads: 'true',
-      block_cookie_banners: 'true',
-      block_trackers: 'true',
-      wait_for_network_idle: options.wait_for_network_idle ? 'true' : 'false',
-      delay: options.delay || 0,
-    });
-
-    console.log('ScreenshotOne URL:', screenshotOneUrl);
-
-    // Make request with timeout matching our API timeout + 1 second buffer
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), (apiTimeout + 1) * 1000);
-
-    const response = await fetch(screenshotOneUrl, {
-      method: 'GET',
-      signal: controller.signal,
-      headers: {
-        'User-Agent': 'ScreenRecorderPro-Netlify/1.0'
-      }
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      console.error('ScreenshotOne API error:', response.status, response.statusText);
+    // Check environment variables first
+    if (!process.env.SCREENSHOTONE_API_KEY) {
       return {
-        statusCode: response.status,
+        statusCode: 500,
+        headers,
         body: JSON.stringify({
-          message: `ScreenshotOne API error: ${response.status} ${response.statusText}`
+          message: 'Server configuration error: ScreenshotOne API key not configured',
+          error: 'MISSING_API_KEY'
         })
       };
     }
 
-    // Get the video data
-    const videoBuffer = await response.arrayBuffer();
-    const videoBase64 = Buffer.from(videoBuffer).toString('base64');
+    const requestData = JSON.parse(event.body || '{}');
+    const { url, options, license_key, site_url } = requestData;
 
-    console.log(`Video created successfully. Size: ${videoBuffer.byteLength} bytes`);
+    const licenseHeader = event.headers['x-plugin-license'] || license_key || 'free';
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify({
-        video_data: videoBase64,
-        duration: options.duration || 5,
-        format: options.format || 'mp4',
-        size: videoBuffer.byteLength
-      })
-    };
+    console.log('=== Request Details ===');
+    console.log('Target URL:', url);
+    console.log('Duration requested:', options?.duration);
 
-  } catch (error) {
-    console.error('Function error:', error);
-
-    // Handle different types of errors
-    let errorMessage = 'Unknown error occurred';
-
-    if (error.name === 'AbortError') {
-      errorMessage = `Request timed out after ${apiTimeout || 6} seconds. Try reducing the duration or using a simpler page.`;
-    } else if (error.message) {
-      errorMessage = error.message;
+    if (!url) {
+      return {
+        statusCode: 400,
+        headers,
+        body: JSON.stringify({ message: 'URL is required' })
+      };
     }
 
+    // Validate license and determine plan limits
+    const licenseCheck = await validateLicense(licenseHeader, site_url);
+    if (!licenseCheck.valid) {
+      return {
+        statusCode: 403,
+        headers,
+        body: JSON.stringify({ message: licenseCheck.message })
+      };
+    }
+
+    // IMPORTANT: Enforce duration limits based on Netlify tier
+    const maxDuration = getMaxDurationForPlan(licenseCheck.plan);
+    const requestedDuration = parseInt(options?.duration || '3');
+
+    if (requestedDuration > maxDuration) {
+      console.log(`❌ Duration ${requestedDuration}s exceeds limit of ${maxDuration}s for plan ${licenseCheck.plan}`);
+      return {
+        statusCode: 400,
+        headers,
+        body: JSON.stringify({
+          message: `Recording duration limited to ${maxDuration} seconds on current plan. Upgrade for longer recordings.`,
+          error: 'DURATION_LIMIT_EXCEEDED',
+          max_duration: maxDuration,
+          requested_duration: requestedDuration
+        })
+      };
+    }
+
+    // Use the safe duration (capped at limits)
+    const safeDuration = Math.min(requestedDuration, maxDuration);
+
+    console.log(`✅ Using duration: ${safeDuration}s (max allowed: ${maxDuration}s)`);
+
+    // Create recording with safe duration
+    const recordingResult = await callScreenshotOneAPI(url, {
+      ...options,
+      duration: safeDuration.toString() // Override with safe duration
+    });
+
+    if (recordingResult.success) {
+      await incrementUsage(licenseHeader, site_url, url);
+
+      console.log('✅ Recording created successfully');
+
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({
+          success: true,
+          video_data: recordingResult.video_data,
+          file_size: recordingResult.file_size,
+          duration: safeDuration,
+          actual_duration: recordingResult.actual_duration,
+          message: `Recording created successfully (${safeDuration}s)`
+        })
+      };
+    } else {
+      console.log('❌ Recording failed:', recordingResult.error);
+      return {
+        statusCode: 500,
+        headers,
+        body: JSON.stringify({
+          message: 'Failed to create recording: ' + recordingResult.error
+        })
+      };
+    }
+
+  } catch (error) {
+    console.error('❌ Unexpected Error:', error);
     return {
       statusCode: 500,
+      headers,
       body: JSON.stringify({
-        message: `Failed to create recording: ${errorMessage}`
+        message: 'Internal server error: ' + error.message
       })
     };
   }
